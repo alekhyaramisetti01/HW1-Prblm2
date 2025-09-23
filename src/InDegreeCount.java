@@ -18,21 +18,21 @@ import org.apache.hadoop.mapreduce.Mapper;
 import org.apache.hadoop.mapreduce.Reducer;
 import org.apache.hadoop.mapreduce.lib.input.FileInputFormat;
 import org.apache.hadoop.mapreduce.lib.output.FileOutputFormat;
+import org.apache.hadoop.mapreduce.lib.output.TextOutputFormat;
 
 /**
  * Run once:
  *   hadoop jar indegree.jar InDegreeCount <inputPath> <OutputFolder>
  *
  * Produces in HDFS:
- *   <OutputFolder>/by_userid.tsv          (Job1)
- *   <OutputFolder>/by_indegree_desc.tsv   (Job2)
+ *   <OutputFolder>/by_userid.tsv            (Job 1)
+ *   <OutputFolder>/top10_by_indegree.tsv    (Job 2, only top 10)
  */
 public class InDegreeCount {
 
     // ===================== Job 1: In-degree =====================
     public static class InDegreeMapper
             extends Mapper<LongWritable, Text, IntWritable, IntWritable> {
-
         private static final IntWritable ONE  = new IntWritable(1);
         private static final IntWritable ZERO = new IntWritable(0);
         private final IntWritable outKey = new IntWritable();
@@ -40,13 +40,12 @@ public class InDegreeCount {
         @Override
         protected void map(LongWritable key, Text value, Context ctx)
                 throws IOException, InterruptedException {
-
             String line = value.toString();
             if (line == null) return;
             line = line.trim();
             if (line.isEmpty()) return;
 
-            // Split once on whitespace into [userId, friends?]
+            // [userId][whitespace][friend1,friend2,...]  (whitespace may be tab or spaces)
             String[] parts = line.split("\\s+", 2);
             if (parts.length == 0 || parts[0].isEmpty()) return;
 
@@ -55,10 +54,10 @@ public class InDegreeCount {
                 userId = Integer.parseInt(parts[0]);
                 if (userId < 0) return;
             } catch (NumberFormatException e) {
-                return; // malformed left id
+                return;
             }
 
-            // Ensure left user shows up even if nobody lists them
+            // ensure left user appears even with zero in-degree
             outKey.set(userId);
             ctx.write(outKey, ZERO);
 
@@ -66,7 +65,7 @@ public class InDegreeCount {
             String friendsPart = parts[1].trim();
             if (friendsPart.isEmpty()) return;
 
-            // Per-record de-dup; ignore self & bad tokens
+            // per-record de-dup; ignore self & bad tokens
             Set<Integer> unique = new HashSet<>();
             for (String tok : friendsPart.split(",")) {
                 if (tok == null) continue;
@@ -132,20 +131,32 @@ public class InDegreeCount {
                 try {
                     int user = Integer.parseInt(parts[0]);
                     int cnt  = Integer.parseInt(parts[1]);
-                    outKey.set(cnt);
-                    outVal.set(user);
+                    outKey.set(cnt);   // key to sort on (DESC via comparator)
+                    outVal.set(user);  // value: user id
                     ctx.write(outKey, outVal);
                 } catch (NumberFormatException ignored) { }
             }
         }
 
+        /** Emit only the first 10 (globally) because we use 1 reducer. */
         public static class EmitReducer
                 extends Reducer<IntWritable, IntWritable, IntWritable, IntWritable> {
+
+            private final IntWritable outUser  = new IntWritable();
+            private final IntWritable outCount = new IntWritable();
+            private int emitted = 0; // total rows written
+
             @Override
             protected void reduce(IntWritable count, Iterable<IntWritable> users, Context ctx)
                     throws IOException, InterruptedException {
+                if (emitted >= 10) return; // already got top 10
+
                 for (IntWritable user : users) {
-                    ctx.write(user, count); // userId \t count
+                    if (emitted >= 10) break;
+                    outUser.set(user.get());      // userId
+                    outCount.set(count.get());    // in-degree
+                    ctx.write(outUser, outCount); // userId \t inDegree
+                    emitted++;
                 }
             }
         }
@@ -168,11 +179,17 @@ public class InDegreeCount {
 
         // Clean & create parent OutputFolder so tmp dirs can live under it
         if (fs.exists(finalDir)) fs.delete(finalDir, true);
-        fs.mkdirs(finalDir); // <<< important fix
+        fs.mkdirs(finalDir);
 
         // -------- Job 1: In-degree (include zeros) --------
         Job job1 = Job.getInstance(conf, "HW1-P2 InDegree (include zeros)");
         job1.setJarByClass(InDegreeCount.class);
+
+        // force tab separator to avoid newline-between-key/value
+        job1.setOutputFormatClass(TextOutputFormat.class);
+        job1.getConfiguration().set("mapreduce.output.textoutputformat.separator", "\t");
+        job1.getConfiguration().set("mapred.textoutputformat.separator", "\t");
+        job1.getConfiguration().set("mapreduce.output.key.field.separator", "\t");
 
         job1.setMapperClass(InDegreeMapper.class);
         job1.setCombinerClass(InDegreeReducer.class);
@@ -192,9 +209,14 @@ public class InDegreeCount {
             System.exit(1);
         }
 
-        // -------- Job 2: Sort by in-degree (desc) --------
-        Job job2 = Job.getInstance(conf, "HW1-P2 SortByInDegree (desc)");
+        // -------- Job 2: Sort by in-degree (desc) and keep TOP 10 --------
+        Job job2 = Job.getInstance(conf, "HW1-P2 SortByInDegree (TOP 10)");
         job2.setJarByClass(SortByInDegree.class);
+
+        job2.setOutputFormatClass(TextOutputFormat.class);
+        job2.getConfiguration().set("mapreduce.output.textoutputformat.separator", "\t");
+        job2.getConfiguration().set("mapred.textoutputformat.separator", "\t");
+        job2.getConfiguration().set("mapreduce.output.key.field.separator", "\t");
 
         job2.setMapperClass(SortByInDegree.FlipMapper.class);
         job2.setReducerClass(SortByInDegree.EmitReducer.class);
@@ -205,7 +227,8 @@ public class InDegreeCount {
         job2.setOutputValueClass(IntWritable.class);
 
         job2.setSortComparatorClass(SortByInDegree.DescIntComparator.class);
-        job2.setNumReduceTasks(1);
+        job2.setNumReduceTasks(1); // must be 1 so "first 10" is global
+
         FileInputFormat.addInputPath(job2, tmpOutJob1);
         FileOutputFormat.setOutputPath(job2, tmpOutJob2);
 
@@ -214,11 +237,11 @@ public class InDegreeCount {
             System.exit(1);
         }
 
-        // -------- Copy single-part outputs to nice filenames --------
+        // -------- Copy outputs to nice filenames --------
         Path job1Part = new Path(tmpOutJob1, "part-r-00000");
         Path job2Part = new Path(tmpOutJob2, "part-r-00000");
         Path out1 = new Path(finalDir, "by_userid.tsv");
-        Path out2 = new Path(finalDir, "by_indegree_desc.tsv");
+        Path out2 = new Path(finalDir, "top10_by_indegree.tsv");
 
         try (FSDataInputStream in1 = fs.open(job1Part);
              FSDataOutputStream outStream1 = fs.create(out1, true)) {
