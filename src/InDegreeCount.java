@@ -19,14 +19,17 @@ import org.apache.hadoop.mapreduce.Reducer;
 import org.apache.hadoop.mapreduce.lib.input.FileInputFormat;
 import org.apache.hadoop.mapreduce.lib.output.FileOutputFormat;
 
-/** ============================================================
- *  Job 1: InDegreeCount (includes zeros; IntWritable key)
- *  Input : <userId><tab/space><friend1,friend2,...>
- *  Output: userId<TAB>inDegree  (numeric sort by userId if 1 reducer)
- *  ============================================================ */
+/**
+ * Run once:
+ *   hadoop jar indegree.jar InDegreeCount <inputPath> <OutputFolder>
+ *
+ * Produces in HDFS:
+ *   <OutputFolder>/by_userid.tsv          (Job1)
+ *   <OutputFolder>/by_indegree_desc.tsv   (Job2)
+ */
 public class InDegreeCount {
 
-    // ---------------- MAPPER ----------------
+    // ===================== Job 1: In-degree =====================
     public static class InDegreeMapper
             extends Mapper<LongWritable, Text, IntWritable, IntWritable> {
 
@@ -43,7 +46,7 @@ public class InDegreeCount {
             line = line.trim();
             if (line.isEmpty()) return;
 
-            // split once on whitespace into [userId, friends?]
+            // Split once on whitespace into [userId, friends?]
             String[] parts = line.split("\\s+", 2);
             if (parts.length == 0 || parts[0].isEmpty()) return;
 
@@ -55,7 +58,7 @@ public class InDegreeCount {
                 return; // malformed left id
             }
 
-            // include left-side user with 0 so they appear even if nobody lists them
+            // Ensure left user shows up even if nobody lists them
             outKey.set(userId);
             ctx.write(outKey, ZERO);
 
@@ -63,7 +66,7 @@ public class InDegreeCount {
             String friendsPart = parts[1].trim();
             if (friendsPart.isEmpty()) return;
 
-            // per-record de-dup; ignore self & bad tokens
+            // Per-record de-dup; ignore self & bad tokens
             Set<Integer> unique = new HashSet<>();
             for (String tok : friendsPart.split(",")) {
                 if (tok == null) continue;
@@ -87,7 +90,6 @@ public class InDegreeCount {
         }
     }
 
-    // ---------------- REDUCER (also combiner-safe) ----------------
     public static class InDegreeReducer
             extends Reducer<IntWritable, IntWritable, IntWritable, IntWritable> {
         private final IntWritable out = new IntWritable();
@@ -97,25 +99,21 @@ public class InDegreeCount {
             int sum = 0;
             for (IntWritable v : vals) sum += v.get();
             out.set(sum);
-            ctx.write(key, out);
+            ctx.write(key, out); // userId \t inDegree
         }
     }
 
-    /** ============================================================
-     *  Job 2: SortByInDegree (nested public static so RunJar can access)
-     *  Reads : userId<TAB>inDegree (output of Job 1)
-     *  Writes: userId<TAB>inDegree sorted by in-degree DESC
-     *  ============================================================ */
+    // ===================== Job 2: Sort by in-degree (DESC) =====================
     public static class SortByInDegree {
 
-        /** Custom descending comparator for IntWritable (portable across Hadoop builds). */
+        /** Portable descending comparator for IntWritable keys. */
         public static class DescIntComparator extends WritableComparator {
             protected DescIntComparator() { super(IntWritable.class, true); }
             @Override
             public int compare(WritableComparable a, WritableComparable b) {
                 IntWritable x = (IntWritable) a;
                 IntWritable y = (IntWritable) b;
-                return Integer.compare(y.get(), x.get()); // reverse natural order
+                return Integer.compare(y.get(), x.get()); // reverse order
             }
         }
 
@@ -147,43 +145,32 @@ public class InDegreeCount {
             protected void reduce(IntWritable count, Iterable<IntWritable> users, Context ctx)
                     throws IOException, InterruptedException {
                 for (IntWritable user : users) {
-                    ctx.write(user, count);
+                    ctx.write(user, count); // userId \t count
                 }
             }
         }
     }
 
-    /* ============================================================
-     * ONE-RUN DRIVER (single command):
-     * Usage: InDegreeCount <inputPath> <finalOutputDir>
-     *
-     * Writes into <finalOutputDir>:
-     *   by_userid.tsv         (Job 1 results)
-     *   by_indegree_desc.tsv  (Job 2 results)
-     * Uses temp dirs inside <finalOutputDir> and cleans them up.
-     * ============================================================ */
+    // ===================== One-run driver =====================
     public static void main(String[] args) throws Exception {
         if (args.length != 2) {
-            System.err.println("Usage: InDegreeCount <input> <finalOutputDir>");
+            System.err.println("Usage: InDegreeCount <inputPath> <OutputFolder>");
             System.exit(1);
         }
+
         Configuration conf = new Configuration();
         Path inputPath = new Path(args[0]);
         Path finalDir  = new Path(args[1]);
-
-        // temp dirs inside final dir
         Path tmpOutJob1 = new Path(finalDir, "_tmp_job1");
         Path tmpOutJob2 = new Path(finalDir, "_tmp_job2");
 
-        // FS handle
         FileSystem fs = FileSystem.get(conf);
 
-        // ensure final dir is clean
-        if (fs.exists(finalDir)) {
-            fs.delete(finalDir, true);
-        }
+        // Clean & create parent OutputFolder so tmp dirs can live under it
+        if (fs.exists(finalDir)) fs.delete(finalDir, true);
+        fs.mkdirs(finalDir); // <<< important fix
 
-        // ---------- JOB 1: InDegreeCount ----------
+        // -------- Job 1: In-degree (include zeros) --------
         Job job1 = Job.getInstance(conf, "HW1-P2 InDegree (include zeros)");
         job1.setJarByClass(InDegreeCount.class);
 
@@ -197,7 +184,6 @@ public class InDegreeCount {
         job1.setOutputValueClass(IntWritable.class);
 
         job1.setNumReduceTasks(1); // single globally userId-sorted file
-
         FileInputFormat.addInputPath(job1, inputPath);
         FileOutputFormat.setOutputPath(job1, tmpOutJob1);
 
@@ -206,7 +192,7 @@ public class InDegreeCount {
             System.exit(1);
         }
 
-        // ---------- JOB 2: SortByInDegree ----------
+        // -------- Job 2: Sort by in-degree (desc) --------
         Job job2 = Job.getInstance(conf, "HW1-P2 SortByInDegree (desc)");
         job2.setJarByClass(SortByInDegree.class);
 
@@ -219,8 +205,7 @@ public class InDegreeCount {
         job2.setOutputValueClass(IntWritable.class);
 
         job2.setSortComparatorClass(SortByInDegree.DescIntComparator.class);
-        job2.setNumReduceTasks(1); // single globally sorted file
-
+        job2.setNumReduceTasks(1);
         FileInputFormat.addInputPath(job2, tmpOutJob1);
         FileOutputFormat.setOutputPath(job2, tmpOutJob2);
 
@@ -229,9 +214,7 @@ public class InDegreeCount {
             System.exit(1);
         }
 
-        // ---------- Assemble final outputs in <finalOutputDir> ----------
-        fs.mkdirs(finalDir);
-
+        // -------- Copy single-part outputs to nice filenames --------
         Path job1Part = new Path(tmpOutJob1, "part-r-00000");
         Path job2Part = new Path(tmpOutJob2, "part-r-00000");
         Path out1 = new Path(finalDir, "by_userid.tsv");
@@ -246,12 +229,12 @@ public class InDegreeCount {
             IOUtils.copyBytes(in2, outStream2, conf, false);
         }
 
-        // cleanup temps
+        // Cleanup temp dirs
         fs.delete(tmpOutJob1, true);
         fs.delete(tmpOutJob2, true);
 
         System.out.println("Done. Final files:");
-        System.out.println("  " + out1.toString());
-        System.out.println("  " + out2.toString());
+        System.out.println("  " + out1);
+        System.out.println("  " + out2);
     }
 }
