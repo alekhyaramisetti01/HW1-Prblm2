@@ -7,6 +7,7 @@ import java.util.PriorityQueue;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
+import java.util.Locale;
 
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FSDataInputStream;
@@ -24,32 +25,23 @@ import org.apache.hadoop.mapreduce.lib.input.FileInputFormat;
 import org.apache.hadoop.mapreduce.lib.output.FileOutputFormat;
 import org.apache.hadoop.mapreduce.lib.output.TextOutputFormat;
 
-/**
- * Run once:
- *   hadoop jar indegree.jar InDegreeCount <inputPath> <OutputFolder>
- *
- * Produces in HDFS:
- *   <OutputFolder>/by_userid.tsv          (all users with in-degree)
- *   <OutputFolder>/top10_by_indegree.tsv  (top 10 by in-degree, DESC)
- */
+
 public class InDegreeCount {
 
-    // ===================== Job 1: In-degree =====================
     public static class InDegreeMapper
             extends Mapper<LongWritable, Text, IntWritable, IntWritable> {
-        private static final IntWritable ONE  = new IntWritable(1);
-        private static final IntWritable ZERO = new IntWritable(0);
+
+        private static final IntWritable ONE = new IntWritable(1);
         private final IntWritable outKey = new IntWritable();
 
         @Override
         protected void map(LongWritable key, Text value, Context ctx)
                 throws IOException, InterruptedException {
-            String line = value.toString();
-            if (line == null) return;
-            line = line.trim();
+
+            String line = value.toString().trim();
             if (line.isEmpty()) return;
 
-            // [userId][whitespace][friend1,friend2,...]  (whitespace may be tab or spaces)
+            
             String[] parts = line.split("\\s+", 2);
             if (parts.length == 0 || parts[0].isEmpty()) return;
 
@@ -58,37 +50,30 @@ public class InDegreeCount {
                 userId = Integer.parseInt(parts[0]);
                 if (userId < 0) return;
             } catch (NumberFormatException e) {
-                return; // ignore malformed left id
+                return; 
             }
 
-            // ensure left user appears even with zero in-degree
-            outKey.set(userId);
-            ctx.write(outKey, ZERO);
+           
+            if (parts.length < 2 || parts[1].trim().isEmpty()) return;
 
-            if (parts.length < 2) return;
-            String friendsPart = parts[1].trim();
-            if (friendsPart.isEmpty()) return;
-
-            // per-record de-dup; ignore self & bad tokens
-            Set<Integer> unique = new HashSet<>();
-            for (String tok : friendsPart.split(",")) {
-                if (tok == null) continue;
-                tok = tok.trim();
-                if (tok.isEmpty()) continue;
-                int fid;
+           
+            String[] raw = parts[1].split(",");
+            Set<Integer> unique = new HashSet<>(raw.length * 2);
+            for (String r : raw) {
+                String s = r.trim();
+                if (s.isEmpty()) continue;
                 try {
-                    fid = Integer.parseInt(tok);
-                    if (fid < 0) continue;
-                } catch (NumberFormatException e) {
-                    continue;
+                    int fid = Integer.parseInt(s);
+                    if (fid < 0 || fid == userId) continue;
+                    unique.add(fid);
+                } catch (NumberFormatException ignore) {
                 }
-                if (fid == userId) continue; // ignore self-edge
-                unique.add(fid);
             }
 
+          
             for (Integer fid : unique) {
                 outKey.set(fid);
-                ctx.write(outKey, ONE); // incoming edge to fid
+                ctx.write(outKey, ONE); 
             }
         }
     }
@@ -102,11 +87,10 @@ public class InDegreeCount {
             int sum = 0;
             for (IntWritable v : vals) sum += v.get();
             out.set(sum);
-            ctx.write(key, out); // userId \t inDegree
+            ctx.write(key, out); 
         }
     }
 
-    // ===================== One-run driver (Job 1 + normal sort) =====================
     public static void main(String[] args) throws Exception {
         if (args.length != 2) {
             System.err.println("Usage: InDegreeCount <inputPath> <OutputFolder>");
@@ -119,16 +103,18 @@ public class InDegreeCount {
         Path tmpOutJob1 = new Path(finalDir, "_tmp_job1");
 
         FileSystem fs = FileSystem.get(conf);
+        
+        final long tAll0 = System.nanoTime();
 
-        // Clean & create parent OutputFolder so tmp dir can live under it
+   
         if (fs.exists(finalDir)) fs.delete(finalDir, true);
         fs.mkdirs(finalDir);
 
-        // -------- Job 1: In-degree (include zeros) --------
+       
         Job job1 = Job.getInstance(conf, "HW1-P2 InDegree (include zeros)");
         job1.setJarByClass(InDegreeCount.class);
 
-        // force tab separator to avoid newline-between-key/value
+     
         job1.setOutputFormatClass(TextOutputFormat.class);
         job1.getConfiguration().set("mapreduce.output.textoutputformat.separator", "\t");
         job1.getConfiguration().set("mapred.textoutputformat.separator", "\t");
@@ -143,16 +129,21 @@ public class InDegreeCount {
         job1.setOutputKeyClass(IntWritable.class);
         job1.setOutputValueClass(IntWritable.class);
 
-        job1.setNumReduceTasks(1); // single globally userId-sorted file
+        job1.setNumReduceTasks(1); 
         FileInputFormat.addInputPath(job1, inputPath);
         FileOutputFormat.setOutputPath(job1, tmpOutJob1);
 
-        if (!job1.waitForCompletion(true)) {
+     
+        final long tJob10 = System.nanoTime();
+        boolean job1Ok = job1.waitForCompletion(true);
+        final double job1Sec = (System.nanoTime() - tJob10) / 1e9;
+        if (!job1Ok) {
             System.err.println("Job 1 failed.");
             System.exit(1);
         }
+        System.out.printf(Locale.US, "[TIME] MR Job1 took %.3f s%n", job1Sec);
 
-        // -------- Make a nice copy of Job 1 output --------
+     
         Path job1Part = new Path(tmpOutJob1, "part-r-00000");
         Path byUserOut = new Path(finalDir, "by_userid.tsv");
         try (FSDataInputStream in1 = fs.open(job1Part);
@@ -160,49 +151,61 @@ public class InDegreeCount {
             IOUtils.copyBytes(in1, outStream1, conf, false);
         }
 
-        // -------- Normal (non-MR) TOP-10 sort over Job 1 output --------
-        Path top10Out = new Path(finalDir, "top10_by_indegree.tsv");
-        writeTopK(fs, conf, job1Part, top10Out, 10);
+       
+        Path top100Out = new Path(finalDir, "top1000_by_indegree.tsv");
+        writeTopK(fs, conf, job1Part, top100Out, 1000);
 
-        // Cleanup temp dir
+       
         fs.delete(tmpOutJob1, true);
 
-        System.out.println("Done. Final files:");
         System.out.println("  " + byUserOut);
-        System.out.println("  " + top10Out);
+        System.out.println("  " + top100Out);
+
+     
+        final double totalSec = (System.nanoTime() - tAll0) / 1e9;
+        System.out.printf(Locale.US, "[TIME] MR P2 total took %.3f s%n", totalSec);
     }
 
-    /** Read lines "userId<TAB>count" and write top-K by count to dest, sorted DESC. */
+   
     private static void writeTopK(FileSystem fs, Configuration conf,
                                   Path srcPart, Path destFile, int k) throws IOException {
-        // Min-heap: smallest count at head; keep at most k elements.
+        
         PriorityQueue<int[]> heap = new PriorityQueue<>(
-            Comparator.<int[]>comparingInt(a -> a[1])   // by count ASC
-                      .thenComparingInt(a -> a[0])       // then userId ASC (stable tie-break)
+            (a, b) -> {
+                int c = Integer.compare(a[1], b[1]);   
+                if (c != 0) return c;
+                return Integer.compare(b[0], a[0]);    
+            }
         );
 
         try (FSDataInputStream in = fs.open(srcPart);
              BufferedReader br = new BufferedReader(new InputStreamReader(in, "UTF-8"))) {
             String line;
             while ((line = br.readLine()) != null) {
-                if (line.isEmpty()) continue;
-                String[] parts = line.split("\\s+");
+                String t = line.trim();
+                if (t.isEmpty()) continue;
+                String[] parts = t.split("\\s+");
                 if (parts.length < 2) continue;
+
+                int u, c;
                 try {
-                    int user = Integer.parseInt(parts[0]);
-                    int cnt  = Integer.parseInt(parts[1]);
-                    heap.offer(new int[]{user, cnt});
-                    if (heap.size() > k) heap.poll(); // pop smallest
-                } catch (NumberFormatException ignored) { }
+                    u = Integer.parseInt(parts[0]);
+                    c = Integer.parseInt(parts[1]);
+                } catch (NumberFormatException e) {
+                    continue;
+                }
+
+                heap.offer(new int[]{u, c});
+                if (heap.size() > k) heap.poll();
             }
         }
 
-        // Move heap to list and sort DESC by count, then userId ASC for stable order
+        
         List<int[]> top = new ArrayList<>(heap);
         top.sort((a, b) -> {
-            int c = Integer.compare(b[1], a[1]); // count DESC
+            int c = Integer.compare(b[1], a[1]); 
             if (c != 0) return c;
-            return Integer.compare(a[0], b[0]);  // userId ASC
+            return Integer.compare(a[0], b[0]);  
         });
 
         try (FSDataOutputStream out = fs.create(destFile, true)) {
